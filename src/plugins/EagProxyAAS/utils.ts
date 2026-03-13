@@ -8,7 +8,8 @@ import { ClientState, ConnectionState } from "./types.js";
 import { auth, ServerDeviceCodeResponse } from "./auth.js";
 import { config } from "./config.js";
 import { handleCommand } from "./commands.js";
-import { getTokenProfileEasyMc } from "./auth_easymc.js";
+import { getTokenProfileTheAltening } from "./auth_thealtening.js";
+import { resolve4, resolveSrv } from "dns/promises";
 
 const { Vec3 } = vec3 as any;
 const Enums = PLUGIN_MANAGER.Enums;
@@ -16,8 +17,8 @@ const Util = PLUGIN_MANAGER.Util;
 const MAX_LIFETIME_CONNECTED = 10 * 60 * 1000,
   MAX_LIFETIME_AUTH = 5 * 60 * 1000,
   MAX_LIFETIME_LOGIN = 1 * 60 * 1000;
-const REGISTRY = Registry.default("1.8.8"),
-  McBlock = (Block as any).default("1.8.8"),
+const REGISTRY = Registry.default("1.8"),
+  McBlock = (Block as any).default("1.8"),
   LOGIN_CHUNK = generateSpawnChunk().dump();
 const logger = new PLUGIN_MANAGER.Logger("PlayerHandler");
 
@@ -29,6 +30,122 @@ export function hushConsole() {
   global.console.warn = ignoredMethod;
   global.console.error = ignoredMethod;
   global.console.debug = ignoredMethod;
+}
+
+export async function isValidIp(ip: string): Promise<boolean> {
+  const hostPart = ip.split(":")[0];
+  const ipFormat = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+  const match = hostPart.match(ipFormat);
+
+  if (match) {
+    const octets = match.slice(1).map(Number);
+    if (octets.some((octet) => isNaN(octet) || octet < 0 || octet > 255)) return false;
+
+    const [a, b, c, d] = octets;
+    if (
+      a === 10 ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 169 && b === 254) ||
+      a === 127 ||
+      a === 0 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 192 && b === 0 && c === 0) ||
+      (a === 192 && b === 0 && c === 2) ||
+      (a === 198 && b === 51 && c === 100) ||
+      (a === 203 && b === 0 && c === 113) ||
+      a >= 224 ||
+      (a === 192 && b === 88 && c === 99) ||
+      (a === 198 && b >= 18 && b <= 19) ||
+      (a === 192 && b === 52 && c === 193)
+    )
+      return false;
+
+    return true;
+  }
+
+  const hostnameRegex = /^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$/;
+  if (!hostnameRegex.test(hostPart)) return false;
+
+  const lowerHost = hostPart.toLowerCase();
+  if (
+    ["localhost", "local", "0.0.0.0", "127.0.0.1", "::1"].includes(lowerHost) ||
+    lowerHost.endsWith(".local") ||
+    lowerHost.endsWith(".localhost") ||
+    lowerHost.endsWith(".internal") ||
+    lowerHost.endsWith(".intranet") ||
+    lowerHost.endsWith(".localdomain") ||
+    lowerHost.endsWith(".lan")
+  )
+    return false;
+
+  try {
+    if (lowerHost.startsWith("_minecraft._tcp.")) {
+      const srvRecords = await resolveSrv(hostPart);
+      return srvRecords && srvRecords.length > 0;
+    }
+
+    const addresses = await resolve4(hostPart);
+    if (addresses && addresses.length > 0) {
+      return addresses.some((addr) => {
+        const ipMatch = addr.match(ipFormat);
+        if (ipMatch) {
+          const [a, b, c, d] = ipMatch.slice(1).map(Number);
+          return !(a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 127 || a === 0);
+        }
+        return false;
+      });
+    }
+  } catch (e) {
+    if (!lowerHost.startsWith("_minecraft._tcp.")) {
+      try {
+        const srvRecords = await resolveSrv(`_minecraft._tcp.${hostPart}`);
+        return srvRecords && srvRecords.length > 0;
+      } catch (e) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  return true;
+}
+
+function validateSessionObject(session: any) {
+  if (typeof session !== "object" || session === null) return false;
+
+  const hasValidAuth = typeof session.auth === "string";
+  const hasValidUsername = typeof session.username === "string";
+  const hasValidExpiresOn = typeof session.expires_on === "number" || session.expires_on instanceof Date;
+
+  if (!hasValidAuth || !hasValidUsername || !hasValidExpiresOn) return false;
+
+  if (typeof session.session !== "object" || session.session === null) return false;
+
+  const { session: sessionData } = session;
+
+  const hasValidAccessToken = typeof sessionData.accessToken === "string";
+  const hasValidClientToken = typeof sessionData.clientToken === "string";
+
+  if (!hasValidAccessToken || !hasValidClientToken) return false;
+
+  if (typeof sessionData.selectedProfile !== "object" || sessionData.selectedProfile === null) return false;
+
+  const hasValidProfileId = typeof sessionData.selectedProfile.id === "string";
+  const hasValidProfileName = typeof sessionData.selectedProfile.name === "string";
+
+  if (!hasValidProfileId || !hasValidProfileName) return false;
+
+  // Ensure no extra properties exist
+  const validSessionKeys = ["auth", "username", "expires_on", "session"];
+  const validSessionDataKeys = ["accessToken", "clientToken", "selectedProfile"];
+  const validSelectedProfileKeys = ["id", "name"];
+
+  if (Object.keys(session).some((key) => !validSessionKeys.includes(key))) return false;
+  if (Object.keys(sessionData).some((key) => !validSessionDataKeys.includes(key))) return false;
+  if (Object.keys(sessionData.selectedProfile).some((key) => !validSelectedProfileKeys.includes(key))) return false;
+
+  return true;
 }
 
 export function setSG(svr: ServerGlobals) {
@@ -45,7 +162,7 @@ export function disconectIdle() {
   });
 }
 
-export function handleConnect(client: ClientState) {
+export function handleConnect(client: ClientState, additionalParams: { ip: string; port: number; mode: ConnectType; session: any }) {
   client.gameClient.write("login", {
     entityId: 1,
     gameMode: 2,
@@ -79,7 +196,17 @@ export function handleConnect(client: ClientState) {
       text: `${Enums.ChatColor.GOLD}Please wait for instructions.`,
     }),
   });
-  onConnect(client);
+
+  if (additionalParams != null && additionalParams.ip != null && additionalParams.port != null) {
+    sendMessage(client.gameClient, `${Enums.ChatColor.GREEN}Automatically connecting to server ${Enums.ChatColor.GOLD}${additionalParams.ip}:${additionalParams.port}${Enums.ChatColor.GREEN}.`);
+  }
+  if (additionalParams && additionalParams.session && additionalParams.session.expires_on - Date.now() > 24 * 60 * 60 * 1000) {
+    sendMessage(
+      client.gameClient,
+      `${Enums.ChatColor.RED}Your session token is valid for ${Math.floor((additionalParams.session.expires_on - Date.now()) / 1000 / 60)} more minutes, and will expire in less than 24 hours! Please obtain a new session URL.`
+    );
+  }
+  onConnect(client, additionalParams);
 }
 
 export function awaitCommand(client: Client, filter: (msg: string) => boolean): Promise<string> {
@@ -163,7 +290,7 @@ export function sendMessageLogin(client: Client, url: string, token: string) {
   });
 }
 
-export function updateState(client: Client, newState: "CONNECTION_TYPE" | "AUTH_EASYMC" | "AUTH" | "SERVER", uri?: string, code?: string) {
+export function updateState(client: Client, newState: "CONNECTION_TYPE" | "AUTH_THEALTENING" | "AUTH" | "SERVER", uri?: string, code?: string) {
   switch (newState) {
     case "CONNECTION_TYPE":
       client.write("playerlist_header", {
@@ -171,17 +298,17 @@ export function updateState(client: Client, newState: "CONNECTION_TYPE" | "AUTH_
           text: ` ${Enums.ChatColor.GOLD}EaglerProxy Authentication Server `,
         }),
         footer: JSON.stringify({
-          text: `${Enums.ChatColor.RED}Choose the connection type: 1 = online, 2 = offline, 3 = EasyMC.`,
+          text: `${Enums.ChatColor.RED}Choose the connection type: 1 = online, 2 = offline, 3 = TheAltening.`,
         }),
       });
       break;
-    case "AUTH_EASYMC":
+    case "AUTH_THEALTENING":
       client.write("playerlist_header", {
         header: JSON.stringify({
           text: ` ${Enums.ChatColor.GOLD}EaglerProxy Authentication Server `,
         }),
         footer: JSON.stringify({
-          text: `${Enums.ChatColor.RED}easymc.io/get${Enums.ChatColor.GOLD} | ${Enums.ChatColor.RED}/login <alt_token>`,
+          text: `${Enums.ChatColor.RED}panel.thealtening.com/#generator${Enums.ChatColor.GOLD} | ${Enums.ChatColor.RED}/login <alt_token>`,
         }),
       });
       break;
@@ -209,6 +336,54 @@ export function updateState(client: Client, newState: "CONNECTION_TYPE" | "AUTH_
   }
 }
 
+export function printSessionMessage(client: ClientState, session: any, proxySession = PLUGIN_MANAGER.proxy.players.get(client.gameClient.username)) {
+  const stringifiedSession = JSON.stringify(session),
+    url = new URL(proxySession.ws.httpRequest.url, "wss://" + proxySession.ws.httpRequest.headers.host);
+  url.searchParams.set("session", stringifiedSession);
+  url.protocol = "wss:";
+  const secureURL = new URL("/eagpaas/link", "http://" + proxySession.ws.httpRequest.headers.host);
+  secureURL.searchParams.set("url", url.toString());
+  const http = secureURL.toString();
+  secureURL.protocol = "https:";
+  const https = secureURL.toString();
+
+  sendChatComponent(client.gameClient, {
+    text: "Logged in! Use this server URL to continue using this account (open the link; try each one): ",
+    color: "green",
+    extra: [
+      {
+        text: "[https]",
+        color: "gold",
+        hoverEvent: {
+          action: "show_text",
+          value: Enums.ChatColor.GOLD + "Click to copy!",
+        },
+        clickEvent: {
+          action: "open_url",
+          value: https,
+        },
+      },
+      { text: " ", color: "green" },
+      {
+        text: "[http]",
+        color: "gold",
+        hoverEvent: {
+          action: "show_text",
+          value: Enums.ChatColor.GOLD + "Click to copy!",
+        },
+        clickEvent: {
+          action: "open_url",
+          value: http,
+        },
+      },
+    ],
+  });
+  sendChatComponent(client.gameClient, {
+    text: "Revealing/showing the URL to others (including the underling server URL) can potentially allow others to compromise your account.\n" + "Do not click or open any of the above links if others can observe you.",
+    color: "red",
+  });
+}
+
 // assuming that the player will always stay at the same pos
 export function playSelectSound(client: Client) {
   client.write("named_sound_effect", {
@@ -221,7 +396,7 @@ export function playSelectSound(client: Client) {
   });
 }
 
-export async function onConnect(client: ClientState) {
+export async function onConnect(client: ClientState, metadata?: { ip: string; port: number; mode?: ConnectType; session?: object }) {
   try {
     client.state = ConnectionState.AUTH;
     client.lastStatusUpdate = Date.now();
@@ -243,9 +418,6 @@ export async function onConnect(client: ClientState) {
         `ADVISORY FOR HYPIXEL PLAYERS: THIS PROXY FALLS UNDER HYPIXEL'S "DISALLOWED MODIFICATIONS" MOD CATEGORY. JOINING THE SERVER WILL RESULT IN AN IRREPEALABLE PUNISHMENT BEING APPLIED TO YOUR ACCOUNT. YOU HAVE BEEN WARNED - PLAY AT YOUR OWN RISK!`
       );
       await new Promise((res) => setTimeout(res, 2000));
-
-      sendMessageWarning(client.gameClient, `WARNING: It is highly suggested that you turn down settings, as gameplay tends to be very laggy and unplayable on low powered devices.`);
-      await new Promise((res) => setTimeout(res, 2000));
     }
 
     if (config.authentication.enabled) {
@@ -259,155 +431,188 @@ export async function onConnect(client: ClientState) {
       }
     }
 
-    sendCustomMessage(client.gameClient, "What would you like to do?", "gray");
-    sendChatComponent(client.gameClient, {
-      text: "1) ",
-      color: "gold",
-      extra: [
-        {
-          text: "Connect to an online server (Minecraft account needed)",
-          color: "white",
-        },
-      ],
-      hoverEvent: {
-        action: "show_text",
-        value: Enums.ChatColor.GOLD + "Click me to select!",
-      },
-      clickEvent: {
-        action: "run_command",
-        value: "$1",
-      },
-    });
-    sendChatComponent(client.gameClient, {
-      text: "2) ",
-      color: "gold",
-      extra: [
-        {
-          text: "Connect to an offline server (no Minecraft account needed)",
-          color: "white",
-        },
-      ],
-      hoverEvent: {
-        action: "show_text",
-        value: Enums.ChatColor.GOLD + "Click me to select!",
-      },
-      clickEvent: {
-        action: "run_command",
-        value: "$2",
-      },
-    });
-    sendChatComponent(client.gameClient, {
-      text: "3) ",
-      color: "gold",
-      extra: [
-        {
-          text: "Connect to an online server via EasyMC account pool (no Minecraft account needed)",
-          color: "white",
-        },
-      ],
-      hoverEvent: {
-        action: "show_text",
-        value: Enums.ChatColor.GOLD + "Click me to select!",
-      },
-      clickEvent: {
-        action: "run_command",
-        value: "$3",
-      },
-    });
-    sendCustomMessage(client.gameClient, "Select an option from the above (1 = online, 2 = offline, 3 = EasyMC), either by clicking or manually typing out the option's number on the list.", "green");
-    updateState(client.gameClient, "CONNECTION_TYPE");
-
     let chosenOption: ConnectType | null = null;
-    while (true) {
-      const option = await awaitCommand(client.gameClient, (msg) => true);
-      switch (option.replace(/\$/gim, "")) {
-        default:
-          sendCustomMessage(client.gameClient, `I don't understand what you meant by "${option}", please reply with a valid option!`, "red");
+    if (!metadata || metadata.mode == null) {
+      sendCustomMessage(client.gameClient, "What would you like to do?", "gray");
+      sendChatComponent(client.gameClient, {
+        text: "1) ",
+        color: "gold",
+        extra: [
+          {
+            text: "Connect to an online server (Minecraft account needed)",
+            color: "white",
+          },
+        ],
+        hoverEvent: {
+          action: "show_text",
+          value: Enums.ChatColor.GOLD + "Click me to select!",
+        },
+
+        clickEvent: {
+          action: "run_command",
+          value: "$1",
+        },
+      });
+      sendChatComponent(client.gameClient, {
+        text: "2) ",
+        color: "gold",
+        extra: [
+          {
+            text: "Connect to an offline server (no Minecraft account needed)",
+            color: "white",
+          },
+        ],
+        hoverEvent: {
+          action: "show_text",
+          value: Enums.ChatColor.GOLD + "Click me to select!",
+        },
+        clickEvent: {
+          action: "run_command",
+          value: "$2",
+        },
+      });
+      sendChatComponent(client.gameClient, {
+        text: "3) ",
+        color: "gold",
+        extra: [
+          {
+            text: "Connect to an online server via TheAltening account pool (no Minecraft account needed)",
+            color: "white",
+          },
+        ],
+        hoverEvent: {
+          action: "show_text",
+          value: Enums.ChatColor.GOLD + "Click me to select!",
+        },
+        clickEvent: {
+          action: "run_command",
+          value: "$3",
+        },
+      });
+      sendCustomMessage(client.gameClient, "Select an option from the above (1 = online, 2 = offline, 3 = TheAltening), either by clicking or manually typing out the option's number on the list.", "green");
+      updateState(client.gameClient, "CONNECTION_TYPE");
+
+      while (true) {
+        const option = await awaitCommand(client.gameClient, (msg) => true);
+        switch (option.replace(/\$/gim, "")) {
+          default:
+            sendCustomMessage(client.gameClient, `I don't understand what you meant by "${option}", please reply with a valid option!`, "red");
+            break;
+          case "1":
+            chosenOption = ConnectType.ONLINE;
+            break;
+          case "2":
+            chosenOption = ConnectType.OFFLINE;
+            break;
+          case "3":
+            chosenOption = ConnectType.THEALTENING;
+            break;
+        }
+        if (chosenOption != null) {
+          if (option.startsWith("$")) playSelectSound(client.gameClient);
           break;
-        case "1":
-          chosenOption = ConnectType.ONLINE;
-          break;
-        case "2":
-          chosenOption = ConnectType.OFFLINE;
-          break;
-        case "3":
-          chosenOption = ConnectType.EASYMC;
-          break;
+        }
       }
-      if (chosenOption != null) {
-        if (option.startsWith("$")) playSelectSound(client.gameClient);
-        break;
-      }
-    }
+    } else chosenOption = metadata.mode;
 
     if (chosenOption == ConnectType.ONLINE) {
-      if (config.showDisclaimers) {
-        sendMessageWarning(
-          client.gameClient,
-          `WARNING: You will be prompted to log in via Microsoft to obtain a session token necessary to join games. Any data related to your account will not be saved and for transparency reasons this proxy's source code is available on Github.`
-        );
+      if (!metadata || !metadata.session) {
+        if (config.showDisclaimers) {
+          sendMessageWarning(
+            client.gameClient,
+            `WARNING: You will be prompted to log in via Microsoft to obtain a session token necessary to join games. Any data related to your account will not be saved and for transparency reasons this proxy's source code is available on Github.`
+          );
+        }
+        await new Promise((res) => setTimeout(res, 2000));
       }
-      await new Promise((res) => setTimeout(res, 2000));
 
       client.lastStatusUpdate = Date.now();
       let errored = false,
         savedAuth;
-      const quit = { quit: false },
-        authHandler = auth(quit),
-        codeCallback = (code: ServerDeviceCodeResponse) => {
-          updateState(client.gameClient, "AUTH", code.verification_uri, code.user_code);
-          sendMessageLogin(client.gameClient, code.verification_uri, code.user_code);
-        };
-      client.gameClient.once("end", (res) => {
-        quit.quit = true;
-      });
+      if (!metadata || !metadata.session) {
+        const quit = { quit: false },
+          authHandler = auth(quit),
+          codeCallback = (code: ServerDeviceCodeResponse) => {
+            updateState(client.gameClient, "AUTH", code.verification_uri, code.user_code);
+            sendMessageLogin(client.gameClient, code.verification_uri, code.user_code);
+          };
+        client.gameClient.once("end", (res) => {
+          quit.quit = true;
+        });
 
-      authHandler.once("error", (err) => {
-        if (!client.gameClient.ended) client.gameClient.end(err.message);
-        errored = true;
-      });
-      if (errored) return;
-      authHandler.on("code", codeCallback);
-      await new Promise((res) =>
-        authHandler.once("done", (result) => {
-          console.log(result);
-          savedAuth = result;
-          res(result);
-        })
-      );
-      sendMessage(client.gameClient, Enums.ChatColor.BRIGHT_GREEN + "Successfully logged into Minecraft!");
+        authHandler.once("error", (err) => {
+          if (!client.gameClient.ended) client.gameClient.end(err.message);
+          errored = true;
+        });
+        if (errored) return;
+        authHandler.on("code", codeCallback);
+        await new Promise((res) =>
+          authHandler.once("done", (result) => {
+            savedAuth = result;
+            res(result);
+          })
+        );
+        sendMessage(client.gameClient, Enums.ChatColor.BRIGHT_GREEN + "Successfully logged into Minecraft!");
+      }
 
       client.state = ConnectionState.SUCCESS;
       client.lastStatusUpdate = Date.now();
-      updateState(client.gameClient, "SERVER");
-      sendMessage(client.gameClient, `Provide a server to join. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
       let host: string, port: number;
-      while (true) {
-        const msg = await awaitCommand(client.gameClient, (msg) => msg.startsWith("/join")),
-          parsed = msg.split(/ /gi, 3);
-        if (parsed.length < 2) sendMessage(client.gameClient, `Please provide a server to connect to. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
-        else if (parsed.length > 2 && isNaN(parseInt(parsed[2]))) sendMessage(client.gameClient, `A valid port number has to be passed! ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
-        else {
-          host = parsed[1];
-          if (parsed.length > 2) port = parseInt(parsed[2]);
-          if (port != null && !config.allowCustomPorts) {
-            sendCustomMessage(client.gameClient, "You are not allowed to use custom server ports! /join <ip>" + (config.allowCustomPorts ? " [port]" : ""), "red");
-            host = null;
-            port = null;
-          } else {
-            if (host.match(/^(?:\*\.)?((?!hypixel\.net$)[^.]+\.)*hypixel\.net$/) && config.disallowHypixel) {
-              sendCustomMessage(
-                client.gameClient,
-                "Disallowed server, refusing to connect! Hypixel has been known to falsely flag Eaglercraft clients, and thus we do not allow connecting to their server. /join <ip>" + (config.allowCustomPorts ? " [port]" : ""),
-                "red"
-              );
+      if (metadata && metadata.ip != null && metadata.port != null) {
+        host = metadata.ip;
+        port = metadata.port;
+      } else {
+        updateState(client.gameClient, "SERVER");
+        sendMessage(client.gameClient, `Provide a server to join. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
+        while (true) {
+          const msg = await awaitCommand(client.gameClient, (msg) => msg.startsWith("/join")),
+            parsed = msg.split(/ /gi, 3);
+          if (parsed.length < 2) sendMessage(client.gameClient, `Please provide a server to connect to. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
+          else if (parsed.length > 2 && isNaN(parseInt(parsed[2])))
+            sendMessage(client.gameClient, `A valid port number has to be passed! ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
+          else {
+            host = parsed[1];
+            if (parsed.length > 2) port = parseInt(parsed[2]);
+            if (port != null && !config.allowCustomPorts) {
+              sendCustomMessage(client.gameClient, "You are not allowed to use custom server ports! /join <ip>" + (config.allowCustomPorts ? " [port]" : ""), "red");
+              host = null;
+              port = null;
             } else {
-              port = port ?? 25565;
-              break;
+              if (host.match(/^(?:\*\.)?((?!hypixel\.net$)[^.]+\.)*hypixel\.net$/) && config.disallowHypixel) {
+                sendCustomMessage(
+                  client.gameClient,
+                  "Disallowed server, refusing to connect! Hypixel has been known to falsely flag Eaglercraft clients, and thus we do not allow connecting to their server. /join <ip>" + (config.allowCustomPorts ? " [port]" : ""),
+                  "red"
+                );
+              } else if (!(await isValidIp(host))) {
+                sendCustomMessage(client.gameClient, "Invalid server address! /join <ip>" + (config.allowCustomPorts ? " [port]" : ""), "red");
+                host = null;
+                port = null;
+              } else {
+                port = port ?? 25565;
+                break;
+              }
             }
           }
         }
       }
+
+      validateSessionObject(savedAuth);
+      const session = (metadata ? metadata.session : undefined) || {
+        auth: "mojang",
+        username: savedAuth.selectedProfile.name,
+        expires_on: savedAuth.expiresOn,
+        session: {
+          accessToken: savedAuth.accessToken,
+          clientToken: savedAuth.selectedProfile.id,
+          selectedProfile: {
+            id: savedAuth.selectedProfile.id,
+            name: savedAuth.selectedProfile.name,
+          },
+        },
+      };
+      // printSessionMessage(client, session);
+
       try {
         sendChatComponent(client.gameClient, {
           text: `Joining server under ${savedAuth.selectedProfile.name}/your Minecraft account's username! Run `,
@@ -440,18 +645,7 @@ export async function onConnect(client: ClientState) {
           }
         });
 
-        (player as any)._onlineSession = {
-          auth: "mojang",
-          username: savedAuth.selectedProfile.name,
-          session: {
-            accessToken: savedAuth.accessToken,
-            clientToken: savedAuth.selectedProfile.id,
-            selectedProfile: {
-              id: savedAuth.selectedProfile.id,
-              name: savedAuth.selectedProfile.name,
-            },
-          },
-        };
+        (player as any)._onlineSession = session;
 
         await player.switchServers({
           host: host,
@@ -479,19 +673,21 @@ export async function onConnect(client: ClientState) {
           );
         }
       }
-    } else if (chosenOption == ConnectType.EASYMC) {
-      const EASYMC_GET_TOKEN_URL = "easymc.io/get";
+    } else if (chosenOption == ConnectType.THEALTENING) {
+      const THEALTENING_GET_TOKEN_URL = "panel.thealtening.com/#generator";
       client.state = ConnectionState.AUTH;
       client.lastStatusUpdate = Date.now();
-      updateState(client.gameClient, "AUTH_EASYMC");
+      updateState(client.gameClient, "AUTH_THEALTENING");
 
-      sendMessageWarning(client.gameClient, `WARNING: You've chosen to use an account from EasyMC's account pool. Please note that accounts and shared, and may be banned from whatever server you are attempting to join.`);
+      if (config.showDisclaimers) {
+        sendMessageWarning(client.gameClient, `WARNING: You've chosen to use an account from TheAltening's account pool. Please note that accounts and shared, and may be banned from whatever server you are attempting to join.`);
+      }
       sendChatComponent(client.gameClient, {
-        text: "Please generate an alt token at ",
+        text: "Please log in and generate an alt token at ",
         color: "white",
         extra: [
           {
-            text: EASYMC_GET_TOKEN_URL,
+            text: THEALTENING_GET_TOKEN_URL,
             color: "gold",
             hoverEvent: {
               action: "show_text",
@@ -499,7 +695,7 @@ export async function onConnect(client: ClientState) {
             },
             clickEvent: {
               action: "open_url",
-              value: `https://${EASYMC_GET_TOKEN_URL}`,
+              value: `https://${THEALTENING_GET_TOKEN_URL}`,
             },
           },
           {
@@ -554,7 +750,7 @@ export async function onConnect(client: ClientState) {
           });
         } else {
           const token = splitResponse[0];
-          if (token.length != 20) {
+          if (!token.endsWith("@alt.com")) {
             sendChatComponent(client.gameClient, {
               text: "Please provide a valid token (you can get one ",
               color: "red",
@@ -568,7 +764,7 @@ export async function onConnect(client: ClientState) {
                   },
                   clickEvent: {
                     action: "open_url",
-                    value: `https://${EASYMC_GET_TOKEN_URL}`,
+                    value: `https://${THEALTENING_GET_TOKEN_URL}`,
                   },
                 },
                 {
@@ -596,12 +792,12 @@ export async function onConnect(client: ClientState) {
           } else {
             sendCustomMessage(client.gameClient, "Validating alt token...", "gray");
             try {
-              appendOptions = await getTokenProfileEasyMc(token);
+              appendOptions = await getTokenProfileTheAltening(token);
               sendCustomMessage(client.gameClient, `Successfully validated your alt token and retrieved your session profile! You'll be joining to your preferred server as ${appendOptions.username}.`, "green");
               break;
             } catch (err) {
               sendChatComponent(client.gameClient, {
-                text: `EasyMC's servers replied with an error (${err.message}), please try again! `,
+                text: `TheAltening's servers replied with an error (${err.message}), please try again! `,
                 color: "red",
                 extra: [
                   {
@@ -629,30 +825,40 @@ export async function onConnect(client: ClientState) {
 
       client.state = ConnectionState.SUCCESS;
       client.lastStatusUpdate = Date.now();
-      updateState(client.gameClient, "SERVER");
-      sendMessage(client.gameClient, `Provide a server to join. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
       let host: string, port: number;
-      while (true) {
-        const msg = await awaitCommand(client.gameClient, (msg) => msg.startsWith("/join")),
-          parsed = msg.split(/ /gi, 3);
-        if (parsed.length < 2) sendMessage(client.gameClient, `Please provide a server to connect to. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
-        else if (parsed.length > 2 && isNaN(parseInt(parsed[2]))) sendMessage(client.gameClient, `A valid port number has to be passed! ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
-        else {
-          host = parsed[1];
-          if (parsed.length > 2) port = parseInt(parsed[2]);
-          if (port != null && !config.allowCustomPorts) {
-            sendCustomMessage(client.gameClient, "You are not allowed to use custom server ports! /join <ip>", "red");
-            host = null;
-            port = null;
-          } else {
-            port = port ?? 25565;
-            break;
+      if (metadata && metadata.ip != null && metadata.port != null) {
+        host = metadata.ip;
+        port = metadata.port;
+      } else {
+        updateState(client.gameClient, "SERVER");
+        sendMessage(client.gameClient, `Provide a server to join. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
+        while (true) {
+          const msg = await awaitCommand(client.gameClient, (msg) => msg.startsWith("/join")),
+            parsed = msg.split(/ /gi, 3);
+          if (parsed.length < 2) sendMessage(client.gameClient, `Please provide a server to connect to. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
+          else if (parsed.length > 2 && isNaN(parseInt(parsed[2])))
+            sendMessage(client.gameClient, `A valid port number has to be passed! ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
+          else {
+            host = parsed[1];
+            if (parsed.length > 2) port = parseInt(parsed[2]);
+            if (port != null && !config.allowCustomPorts) {
+              sendCustomMessage(client.gameClient, "You are not allowed to use custom server ports! /join <ip>", "red");
+              host = null;
+              port = null;
+            } else if (!(await isValidIp(host))) {
+              sendCustomMessage(client.gameClient, "Invalid server address! /join <ip>" + (config.allowCustomPorts ? " [port]" : ""), "red");
+              host = null;
+              port = null;
+            } else {
+              port = port ?? 25565;
+              break;
+            }
           }
         }
       }
       try {
         sendChatComponent(client.gameClient, {
-          text: `Joining server under ${appendOptions.username}/EasyMC account username! Run `,
+          text: `Joining server under ${appendOptions.username}/TheAltening account username! Run `,
           color: "aqua",
           extra: [
             {
@@ -673,7 +879,7 @@ export async function onConnect(client: ClientState) {
             },
           ],
         });
-        logger.info(`Player ${client.gameClient.username} is attempting to connect to ${host}:${port} under their EasyMC alt token's username (${appendOptions.username}) using EasyMC mode!`);
+        logger.info(`Player ${client.gameClient.username} is attempting to connect to ${host}:${port} under their TheAltening alt token's username (${appendOptions.username}) using TheAltening mode!`);
         const player = PLUGIN_MANAGER.proxy.players.get(client.gameClient.username);
         player.on("vanillaPacket", (packet, origin) => {
           if (origin == "CLIENT" && packet.name == "chat" && (packet.params.message as string).toLowerCase().startsWith("/eag-") && !packet.cancel) {
@@ -683,7 +889,7 @@ export async function onConnect(client: ClientState) {
         });
         (player as any)._onlineSession = {
           ...appendOptions,
-          isEasyMC: true,
+          isTheAltening: true,
         };
 
         await player.switchServers({
@@ -706,24 +912,34 @@ export async function onConnect(client: ClientState) {
     } else {
       client.state = ConnectionState.SUCCESS;
       client.lastStatusUpdate = Date.now();
-      updateState(client.gameClient, "SERVER");
-      sendMessage(client.gameClient, `Provide a server to join. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
       let host: string, port: number;
-      while (true) {
-        const msg = await awaitCommand(client.gameClient, (msg) => msg.startsWith("/join")),
-          parsed = msg.split(/ /gi, 3);
-        if (parsed.length < 2) sendMessage(client.gameClient, `Please provide a server to connect to. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
-        else if (parsed.length > 2 && isNaN(parseInt(parsed[2]))) sendMessage(client.gameClient, `A valid port number has to be passed! ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
-        else {
-          host = parsed[1];
-          if (parsed.length > 2) port = parseInt(parsed[2]);
-          if (port != null && !config.allowCustomPorts) {
-            sendCustomMessage(client.gameClient, "You are not allowed to use custom server ports! /join <ip>", "red");
-            host = null;
-            port = null;
-          } else {
-            port = port ?? 25565;
-            break;
+      if (metadata && metadata.ip != null && metadata.port != null) {
+        host = metadata.ip;
+        port = metadata.port;
+      } else {
+        updateState(client.gameClient, "SERVER");
+        sendMessage(client.gameClient, `Provide a server to join. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
+        while (true) {
+          const msg = await awaitCommand(client.gameClient, (msg) => msg.startsWith("/join")),
+            parsed = msg.split(/ /gi, 3);
+          if (parsed.length < 2) sendMessage(client.gameClient, `Please provide a server to connect to. ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
+          else if (parsed.length > 2 && isNaN(parseInt(parsed[2])))
+            sendMessage(client.gameClient, `A valid port number has to be passed! ${Enums.ChatColor.GOLD}/join <ip>${config.allowCustomPorts ? " [port]" : ""}${Enums.ChatColor.RESET}.`);
+          else {
+            host = parsed[1];
+            if (parsed.length > 2) port = parseInt(parsed[2]);
+            if (port != null && !config.allowCustomPorts) {
+              sendCustomMessage(client.gameClient, "You are not allowed to use custom server ports! /join <ip>", "red");
+              host = null;
+              port = null;
+            } else if (!(await isValidIp(host))) {
+              sendCustomMessage(client.gameClient, "Invalid server address! /join <ip>" + (config.allowCustomPorts ? " [port]" : ""), "red");
+              host = null;
+              port = null;
+            } else {
+              port = port ?? 25565;
+              break;
+            }
           }
         }
       }

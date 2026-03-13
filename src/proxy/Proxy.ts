@@ -30,6 +30,7 @@ import { SkinServer } from "./skins/SkinServer.js";
 
 let instanceCount = 0;
 const chalk = new Chalk({ level: 2 });
+const motdMatcher = /^accept: motd/i;
 
 export class Proxy extends EventEmitter {
   public packetRegistry: Map<
@@ -133,9 +134,6 @@ export class Proxy extends EventEmitter {
         noServer: true,
       });
     }
-    this.httpServer.on("error", (err) => {
-      this._logger.warn(`HTTP server threw an error: ${err.stack}`);
-    });
     this.wsServer.on("error", (err) => {
       this._logger.warn(`WebSocket server threw an error: ${err.stack}`);
     });
@@ -145,6 +143,16 @@ export class Proxy extends EventEmitter {
       } catch (err) {
         this._logger.error(`Error was caught whilst trying to handle WebSocket upgrade! Error: ${err.stack ?? err}`);
       }
+    });
+    await new Promise((res, rej) => {
+      this.httpServer.once("listening", res);
+      this.httpServer.once("error", (err) => {
+        this._logger.error(`Error was caught whilst trying to bind HTTP server! Error: ${err.stack ?? err}`);
+        rej(err);
+      });
+    });
+    this.httpServer.on("error", (err) => {
+      this._logger.warn(`HTTP server threw an error: ${err.stack}`);
     });
     process.on("beforeExit", () => {
       this._logger.info("Cleaning up before exiting...");
@@ -156,7 +164,8 @@ export class Proxy extends EventEmitter {
   }
 
   private _handleNonWSRequest(req: http.IncomingMessage, res: http.ServerResponse, config: Config["adapter"]) {
-    if (this.ratelimit.http.consume(req.socket.remoteAddress).success) {
+    const inc = this.ratelimit.http.consume(req.socket.remoteAddress);
+    if (inc.success) {
       const ctx: Util.Handlable = { handled: false };
       this.emit("httpConnection", req, res, ctx);
       if (!ctx.handled) res.setHeader("Content-Type", "text/html").writeHead(426).end(UPGRADE_REQUIRED_RESPONSE);
@@ -189,26 +198,44 @@ export class Proxy extends EventEmitter {
       }
     }, this.LOGIN_TIMEOUT);
     try {
-      if (firstPacket.toString() === "Accept: MOTD") {
+      if (motdMatcher.test(firstPacket.toString())) {
         if (!this.ratelimit.motd.consume(req.socket.remoteAddress).success) {
           return ws.close();
         }
         if (this.broadcastMotd) {
-          if ((this.broadcastMotd as any)._static) {
-            this.broadcastMotd.jsonMotd.data.online = this.players.size;
-            // sample for players
-            this.broadcastMotd.jsonMotd.data.players = [];
-            const playerSample = [...this.players.keys()].filter((sample) => !sample.startsWith("!phs_")).slice(0, 5);
-            this.broadcastMotd.jsonMotd.data.players = playerSample;
-            if (this.players.size - playerSample.length > 0) this.broadcastMotd.jsonMotd.data.players.push(`${Enums.ChatColor.GRAY}${Enums.ChatColor.ITALIC}(and ${this.players.size - playerSample.length} more)`);
-
-            const bufferized = this.broadcastMotd.toBuffer();
+          const eventDetail = { motd: null };
+          this.emit("fetchMotd", ws, req, eventDetail);
+          eventDetail.motd = await eventDetail.motd;
+          if (eventDetail.motd != null) {
+            const bufferized = eventDetail.motd.toBuffer();
             ws.send(bufferized[0]);
             if (bufferized[1] != null) ws.send(bufferized[1]);
           } else {
-            const motd = this.broadcastMotd.toBuffer();
-            ws.send(motd[0]);
-            if (motd[1] != null) ws.send(motd[1]);
+            if (this.config.motd == "REALTIME") {
+              const motd = await Motd.MOTD.generateMOTDFromPing(this.config.server.host, this.config.server.port, this.config.useNatives).catch((err) => {
+                this._logger.warn(`Error polling ${this.config.server.host}:${this.config.server.port} for MOTD: ${err.stack ?? err}`);
+              });
+              if (motd) {
+                const bufferized = this.broadcastMotd.toBuffer();
+                ws.send(bufferized[0]);
+                if (bufferized[1] != null) ws.send(bufferized[1]);
+              }
+            } else if ((this.broadcastMotd as any)._static) {
+              this.broadcastMotd.jsonMotd.data.online = this.players.size;
+              // sample for players
+              this.broadcastMotd.jsonMotd.data.players = [];
+              const playerSample = [...this.players.keys()].filter((sample) => !sample.startsWith("!phs_")).slice(0, 5);
+              this.broadcastMotd.jsonMotd.data.players = playerSample;
+              if (this.players.size - playerSample.length > 0) this.broadcastMotd.jsonMotd.data.players.push(`${Enums.ChatColor.GRAY}${Enums.ChatColor.ITALIC}(and ${this.players.size - playerSample.length} more)`);
+
+              const bufferized = this.broadcastMotd.toBuffer();
+              ws.send(bufferized[0]);
+              if (bufferized[1] != null) ws.send(bufferized[1]);
+            } else {
+              const motd = this.broadcastMotd.toBuffer();
+              ws.send(motd[0]);
+              if (motd[1] != null) ws.send(motd[1]);
+            }
           }
         }
         handled = true;
@@ -373,6 +400,7 @@ export class Proxy extends EventEmitter {
 interface ProxyEvents {
   playerConnect: (player: Player) => void;
   playerDisconnect: (player: Player) => void;
+  fetchMotd: (ws: WebSocket, erq: http.IncomingMessage, result: { motd: Promise<Motd.MOTD> }) => void;
 
   httpConnection: (req: http.IncomingMessage, res: http.ServerResponse, ctx: Util.Handlable) => void;
   wsConnection: (ws: WebSocket, req: http.IncomingMessage, ctx: Util.Handlable) => void;
